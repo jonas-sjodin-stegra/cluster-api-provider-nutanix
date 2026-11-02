@@ -640,9 +640,6 @@ func (r *NutanixClusterReconciler) reconcileFailureDomains(rctx *nctx.ClusterCon
 		failureDomains[fd.Name] = capiv1beta1.FailureDomainSpec{ControlPlane: fd.ControlPlane}
 	}
 
-	// Set the failure domains for nutanixcluster status
-	rctx.NutanixCluster.Status.FailureDomains = failureDomains
-
 	if len(validationErrs) != 0 {
 		v1beta1conditions.MarkFalse(rctx.NutanixCluster, infrav1.FailureDomainsValidatedCondition,
 			infrav1.FailureDomainsMisconfiguredReason, capiv1beta1.ConditionSeverityWarning, "%s", errors.Join(validationErrs...).Error())
@@ -652,9 +649,12 @@ func (r *NutanixClusterReconciler) reconcileFailureDomains(rctx *nctx.ClusterCon
 			Reason:  infrav1.FailureDomainsMisconfiguredReason,
 			Message: errors.Join(validationErrs...).Error(),
 		})
-		return nil
+		// Preserve the last validated placement information and retry validation.
+		// An empty list can cause CAPI to create Machines without a failure domain.
+		return errors.Join(validationErrs...)
 	}
 
+	rctx.NutanixCluster.Status.FailureDomains = failureDomains
 	v1beta1conditions.MarkTrue(rctx.NutanixCluster, infrav1.FailureDomainsValidatedCondition)
 	v1beta2conditions.Set(rctx.NutanixCluster, metav1.Condition{
 		Type:   string(infrav1.FailureDomainsValidatedCondition),
