@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/utils/ptr"
+	capiv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint:staticcheck // suppress complaining on Deprecated package
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,6 +51,43 @@ import (
 	mockk8sclient "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/mocks/k8sclient"
 	nctx "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/pkg/context"
 )
+
+func TestFailureDomainValidationPreservesStatus(t *testing.T) {
+	for _, lookupErr := range []error{
+		apierrors.NewServiceUnavailable("temporary API outage"),
+		apierrors.NewNotFound(schema.GroupResource{Resource: "nutanixfailuredomains"}, "zone-a"),
+	} {
+		t.Run(lookupErr.Error(), func(t *testing.T) {
+			mockClient := mockctlclient.NewMockClient(gomock.NewController(t))
+			mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(lookupErr)
+			cluster := &infrav1.NutanixCluster{
+				Spec: infrav1.NutanixClusterSpec{
+					ControlPlaneFailureDomains: []corev1.LocalObjectReference{{Name: "zone-a"}},
+				},
+			}
+			cluster.Status.Ready = true
+			cluster.Status.FailureDomains = capiv1beta1.FailureDomains{"zone-a": {ControlPlane: true}}
+			previous := cluster.DeepCopy().Status.FailureDomains
+			rctx := &nctx.ClusterContext{Context: context.Background(), NutanixCluster: cluster}
+			reconciler := &NutanixClusterReconciler{Client: mockClient}
+
+			err := reconciler.reconcileFailureDomains(rctx)
+			assert.Equal(t, previous, cluster.Status.FailureDomains, "validation failure must not erase placement information")
+			require.Error(t, err, "return an error so reconciliation retries")
+			if !apierrors.IsNotFound(lookupErr) {
+				assert.Contains(t, err.Error(), lookupErr.Error())
+			}
+			require.Len(t, cluster.Status.Conditions, 1)
+			assert.Equal(t, infrav1.FailureDomainsValidatedCondition, cluster.Status.Conditions[0].Type)
+			assert.Equal(t, corev1.ConditionFalse, cluster.Status.Conditions[0].Status)
+
+			// Explicitly removing the configuration must still clear the old status.
+			cluster.Spec.ControlPlaneFailureDomains = nil
+			require.NoError(t, reconciler.reconcileFailureDomains(rctx))
+			assert.Empty(t, cluster.Status.FailureDomains)
+		})
+	}
+}
 
 func TestNutanixClusterReconciler_ConvergedClientCacheDeletion(t *testing.T) {
 	t.Run("should delete converged client from cache during cluster deletion", func(t *testing.T) {
@@ -297,7 +335,7 @@ func TestNutanixClusterReconciler(t *testing.T) {
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(result.RequeueAfter).To(BeZero())
 			})
-			It("should not error and not requeue if controlPlaneFailureDomains are configured and cluster is Ready", func() {
+			It("should retry validation of missing controlPlaneFailureDomains even when the cluster is Ready", func() {
 				ntnxCluster.Spec.ControlPlaneFailureDomains = []corev1.LocalObjectReference{fdRef}
 				g.Expect(k8sClient.Create(ctx, ntnxCluster)).To(Succeed())
 				ntnxCluster.Status.Ready = true
@@ -305,7 +343,7 @@ func TestNutanixClusterReconciler(t *testing.T) {
 					Context:        ctx,
 					NutanixCluster: ntnxCluster,
 				})
-				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(err).To(HaveOccurred())
 				g.Expect(result.RequeueAfter).To(BeZero())
 			})
 			It("should not error if controlPlaneFailureDomains are configured with unique failure domain names", func() {
@@ -339,7 +377,7 @@ func TestNutanixClusterReconciler(t *testing.T) {
 					Context:        ctx,
 					NutanixCluster: appliedNtnxCluster,
 				})
-				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(err).To(HaveOccurred())
 
 				g.Expect(appliedNtnxCluster.Status.Conditions).To(ContainElement(
 					gstruct.MatchFields(
