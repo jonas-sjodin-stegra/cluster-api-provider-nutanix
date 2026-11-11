@@ -30,6 +30,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	clusterModels "github.com/nutanix/ntnx-api-golang-clients/clustermgmt-go-client/v4/models/clustermgmt/v4/config"
 	multidomainModels "github.com/nutanix/ntnx-api-golang-clients/multidomain-go-client/v4/models/multidomain/v4/config"
@@ -355,6 +356,10 @@ func FindVMByName(ctx context.Context, client *v4Converged.Client, vmName string
 
 	if len(vms) == 0 {
 		return nil, nil
+	}
+
+	if vms[0].ExtId == nil {
+		return nil, fmt.Errorf("vm with name %s has a nil ExtId", vmName)
 	}
 
 	return FindVMByUUID(ctx, client, *vms[0].ExtId, projectExtID, pcVersion)
@@ -1342,6 +1347,12 @@ func GetImageByLookup(
 	project *nctx.ProjectInfo,
 	pcVersion string,
 ) (*imageModels.Image, error) {
+	if imageTemplate == nil || imageLookupBaseOS == nil || k8sVersion == nil {
+		return nil, fmt.Errorf(
+			"image lookup requires non-nil imageTemplate, imageLookupBaseOS, and k8sVersion",
+		)
+	}
+
 	var projectExtID *string
 	if project != nil {
 		projectExtID = project.ExtID
@@ -1374,7 +1385,10 @@ func GetImageByLookup(
 	// we fall back to the legacy (unscoped) lookup behavior.
 	projectAware := isPCVersionHigherThan75(pcVersion) && projectExtID != nil
 
-	re := regexp.MustCompile(templateBytes.String())
+	re, err := regexp.Compile(templateBytes.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile image lookup regex %q: %w", templateBytes.String(), err)
+	}
 	// Partition the regex survivors into images owned by this project versus
 	// images merely shared with it. When not project-aware everything lands in
 	// owned, preserving the legacy behavior.
@@ -1768,12 +1782,51 @@ func getOrCreateCategoryForProject(
 			ProjectExtId: category.ProjectExtId,
 		})
 		if err != nil {
+			// Prism returns this when the key-value was created between List and Create.
+			// The response has no category body; the existing extId is only in the message:
+			// "400 InvalidArgument: Operation failed as a category with the provided key and value already exists with extId: <extId>"
+			extID, alreadyExists, parseErr := existingCategoryExtID(err)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			if alreadyExists {
+				log.V(1).Info(fmt.Sprintf("Category with key %s and value %s already exists.", categoryIdentifier.Key, categoryIdentifier.Value))
+				if prismCategory != nil && prismCategory.ExtId != nil {
+					return prismCategory, nil
+				}
+				if extID == "" {
+					return nil, fmt.Errorf("category with key %s and value %s already exists, but the error did not include an extId: %w", categoryIdentifier.Key, categoryIdentifier.Value, err)
+				}
+				category.ExtId = ptr.To(extID)
+				return category, nil
+			}
 			errorMsg := fmt.Errorf("failed to create category with key %s and value %s. error: %w", categoryIdentifier.Key, categoryIdentifier.Value, err)
 			log.Error(errorMsg, "failed to create category")
 			return nil, errorMsg
 		}
 	}
 	return prismCategory, nil
+}
+
+const categoryAlreadyExistsMessage = "category with the provided key and value already exists"
+
+const categoryAlreadyExistsExtIDPattern = `already exists with extId:\s*(\S+)`
+
+// existingCategoryExtID reports whether err is Prism's "category already exists"
+// response and, when present, the extId embedded in that message.
+func existingCategoryExtID(err error) (string, bool, error) {
+	if err == nil || !strings.Contains(err.Error(), categoryAlreadyExistsMessage) {
+		return "", false, nil
+	}
+	re, compileErr := regexp.Compile(categoryAlreadyExistsExtIDPattern)
+	if compileErr != nil {
+		return "", false, fmt.Errorf("failed to compile category already-exists regex: %w", compileErr)
+	}
+	matches := re.FindStringSubmatch(err.Error())
+	if len(matches) < 2 {
+		return "", true, nil
+	}
+	return strings.TrimRight(matches[1], ".,;"), true, nil
 }
 
 func isCategoryUsableForProject(category *prismModels.Category, projectExtID string) bool {
@@ -1843,20 +1896,26 @@ func GetPrismReferencesOfCategoryIdentifiersForProject(
 	return categoryReferences, nil
 }
 
-// Regex for PC version format 202x.xx.xx.xx.
-var pcVersion202xRe = regexp.MustCompile(`^202(\d(\.\d+)+)$`)
+const pcVersion202xPattern = `^202(\d(\.\d+)+)$`
 
-// Regex for PC version format 7.xx.xx.
-var pcVersion7xRe = regexp.MustCompile(`^7((\.\d+)+)$`)
+const pcVersion7xPattern = `^7((\.\d+)+)$`
 
 // is202XPcVersion checks if the version is of the format 202x.xx.xx..
-func is202XPcVersion(version string) bool {
-	return pcVersion202xRe.MatchString(version)
+func is202XPcVersion(version string) (bool, error) {
+	re, err := regexp.Compile(pcVersion202xPattern)
+	if err != nil {
+		return false, fmt.Errorf("failed to compile PC 202x version regex: %w", err)
+	}
+	return re.MatchString(version), nil
 }
 
 // is7XPcVersion checks if the version is of the format 7.xx.xx..
-func is7XPcVersion(version string) bool {
-	return pcVersion7xRe.MatchString(version)
+func is7XPcVersion(version string) (bool, error) {
+	re, err := regexp.Compile(pcVersion7xPattern)
+	if err != nil {
+		return false, fmt.Errorf("failed to compile PC 7.x version regex: %w", err)
+	}
+	return re.MatchString(version), nil
 }
 
 // CleanPCVersion normalizes a Prism Central version string by trimming whitespace,
@@ -1927,19 +1986,37 @@ func CompareVersions(v1, v2 string) int {
 // branch can't be parsed is if the cluster is running master, or some other
 // non-release branch. This is only expected in a test/debug situation and is
 // the motivation for making an unparseable format greater.
-func ComparePCVersions(v1, v2 string) int {
+// A non-nil error means a version-format regex failed to compile.
+func ComparePCVersions(v1, v2 string) (int, error) {
 	cleanV1 := CleanPCVersion(v1)
 	cleanV2 := CleanPCVersion(v2)
 
-	// Special case for comparing PC versions of format 7.xx and 202x.xx.xx
-	if is7XPcVersion(cleanV1) && is202XPcVersion(cleanV2) {
-		return 1
+	v1Is7, err := is7XPcVersion(cleanV1)
+	if err != nil {
+		return 0, err
 	}
-	if is7XPcVersion(cleanV2) && is202XPcVersion(cleanV1) {
-		return -1
+	v2Is202, err := is202XPcVersion(cleanV2)
+	if err != nil {
+		return 0, err
+	}
+	// Special case for comparing PC versions of format 7.xx and 202x.xx.xx
+	if v1Is7 && v2Is202 {
+		return 1, nil
 	}
 
-	return CompareVersions(cleanV1, cleanV2)
+	v2Is7, err := is7XPcVersion(cleanV2)
+	if err != nil {
+		return 0, err
+	}
+	v1Is202, err := is202XPcVersion(cleanV1)
+	if err != nil {
+		return 0, err
+	}
+	if v2Is7 && v1Is202 {
+		return -1, nil
+	}
+
+	return CompareVersions(cleanV1, cleanV2), nil
 }
 
 // isPCVersionHigherThan75 returns true if the PC version is >= 7.6. Version may include a "pc." prefix (e.g. "pc.7.6.0.5").
@@ -2254,6 +2331,7 @@ func getGPUFromProfile(ctx context.Context, client *v4Converged.Client, peUUID s
 }
 
 func GetGPUsForPE(ctx context.Context, client *v4Converged.Client, peUUID string, gpu infrav1.NutanixGPU) ([]*vmmconfig.Gpu, error) {
+	log := ctrl.LoggerFrom(ctx)
 	var filter string
 	var gpus []*vmmconfig.Gpu
 
@@ -2268,19 +2346,18 @@ func GetGPUsForPE(ctx context.Context, client *v4Converged.Client, peUUID string
 		return nil, err
 	}
 	for _, physicalGPU := range physicalGPUs {
-		if physicalGPU.PhysicalGpuConfig.IsInUse != nil && *physicalGPU.PhysicalGpuConfig.IsInUse {
+		cfg := physicalGPU.PhysicalGpuConfig
+		if cfg == nil {
+			log.V(1).Info("skipping physical GPU with nil PhysicalGpuConfig")
 			continue
 		}
-
-		vmGpu := vmmconfig.NewGpu()
-		vmGpu.Name = physicalGPU.PhysicalGpuConfig.DeviceName
-		vmGpu.DeviceId = ptr.To(int(*physicalGPU.PhysicalGpuConfig.DeviceId))
-		vmGpu.Mode = vmmconfig.GPUMODE_PASSTHROUGH_COMPUTE.Ref()
-		if physicalGPU.PhysicalGpuConfig.Type != nil && *physicalGPU.PhysicalGpuConfig.Type == clusterModels.GPUTYPE_PASSTHROUGH_GRAPHICS {
-			vmGpu.Mode = vmmconfig.GPUMODE_PASSTHROUGH_GRAPHICS.Ref()
+		mode := vmmconfig.GPUMODE_PASSTHROUGH_COMPUTE.Ref()
+		if cfg.Type != nil && *cfg.Type == clusterModels.GPUTYPE_PASSTHROUGH_GRAPHICS {
+			mode = vmmconfig.GPUMODE_PASSTHROUGH_GRAPHICS.Ref()
 		}
-		vmGpu.Vendor = gpuVendorStringToGpuVendor(*physicalGPU.PhysicalGpuConfig.VendorName)
-		gpus = append(gpus, vmGpu)
+		if vmGpu := gpuConfigToVMGpu(log, "physical", cfg.DeviceName, cfg.DeviceId, cfg.VendorName, cfg.IsInUse, mode); vmGpu != nil {
+			gpus = append(gpus, vmGpu)
+		}
 	}
 
 	if gpu.Name != nil {
@@ -2294,18 +2371,42 @@ func GetGPUsForPE(ctx context.Context, client *v4Converged.Client, peUUID string
 		return nil, err
 	}
 	for _, virtualGPU := range virtualGPUs {
-		if virtualGPU.VirtualGpuConfig.IsInUse != nil && *virtualGPU.VirtualGpuConfig.IsInUse {
+		cfg := virtualGPU.VirtualGpuConfig
+		if cfg == nil {
+			log.V(1).Info("skipping virtual GPU with nil VirtualGpuConfig")
 			continue
 		}
-
-		vmGpu := vmmconfig.NewGpu()
-		vmGpu.Name = virtualGPU.VirtualGpuConfig.DeviceName
-		vmGpu.DeviceId = ptr.To(int(*virtualGPU.VirtualGpuConfig.DeviceId))
-		vmGpu.Mode = vmmconfig.GPUMODE_VIRTUAL.Ref()
-		vmGpu.Vendor = gpuVendorStringToGpuVendor(*virtualGPU.VirtualGpuConfig.VendorName)
-		gpus = append(gpus, vmGpu)
+		if vmGpu := gpuConfigToVMGpu(log, "virtual", cfg.DeviceName, cfg.DeviceId, cfg.VendorName, cfg.IsInUse, vmmconfig.GPUMODE_VIRTUAL.Ref()); vmGpu != nil {
+			gpus = append(gpus, vmGpu)
+		}
 	}
 	return gpus, nil
+}
+
+// gpuConfigToVMGpu builds a *vmmconfig.Gpu from the common fields of a physical
+// or virtual GPU config returned by Prism Central. It returns nil (and logs the
+// reason) when the GPU should be skipped: it is already in use, is missing a
+// deviceId/vendorName, or has a deviceId that does not fit the platform int.
+// kind is used only for log messages ("physical" / "virtual").
+func gpuConfigToVMGpu(log logr.Logger, kind string, deviceName *string, deviceID *int64, vendorName *string, isInUse *bool, mode *vmmconfig.GpuMode) *vmmconfig.Gpu {
+	if isInUse != nil && *isInUse {
+		return nil
+	}
+	if deviceID == nil || vendorName == nil {
+		log.V(1).Info(fmt.Sprintf("skipping %s GPU missing deviceId or vendorName", kind))
+		return nil
+	}
+	if int64(int(*deviceID)) != *deviceID {
+		log.V(1).Info(fmt.Sprintf("skipping %s GPU with deviceId %d outside platform int range", kind, *deviceID))
+		return nil
+	}
+
+	vmGpu := vmmconfig.NewGpu()
+	vmGpu.Name = deviceName
+	vmGpu.DeviceId = ptr.To(int(*deviceID))
+	vmGpu.Mode = mode
+	vmGpu.Vendor = gpuVendorStringToGpuVendor(*vendorName)
+	return vmGpu
 }
 
 func gpuVendorStringToGpuVendor(vendor string) *vmmconfig.GpuVendor {
@@ -2558,6 +2659,10 @@ func detachVolumeGroupsFromVM(ctx context.Context, client *v4Converged.Client, v
 		}
 
 		volumeGroup := disk.GetBackingInfo().(vmmconfig.ADSFVolumeGroupReference)
+		if volumeGroup.VolumeGroupExtId == nil {
+			log.Info(fmt.Sprintf("skipping volume group with nil ExtId on virtual machine %s", vmName))
+			continue
+		}
 		volumeGroupExtId := *volumeGroup.VolumeGroupExtId
 
 		log.Info(fmt.Sprintf("detaching volume group %s from virtual machine %s", volumeGroupExtId, vmName))

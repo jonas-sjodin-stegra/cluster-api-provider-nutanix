@@ -47,6 +47,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	capiv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint:staticcheck // suppress complaining on Deprecated package
 	capiv1beta2 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -522,6 +523,33 @@ func TestNutanixMachineReconciler_SetupWithManager_ClusterToTypedObjectsMapperEr
 	err = reconciler.SetupWithManager(ctx, mgr)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to create mapper for Cluster to NutanixMachine")
+}
+
+func TestNutanixMachineValidateCDRomAdapters(t *testing.T) {
+	for _, tc := range []struct {
+		adapter   infrav1.NutanixMachineDiskAdapterType
+		wantError bool
+	}{
+		{adapter: infrav1.NutanixMachineDiskAdapterTypeIDE},
+		{adapter: infrav1.NutanixMachineDiskAdapterTypeSATA},
+		{adapter: infrav1.NutanixMachineDiskAdapterTypePCI, wantError: true},
+	} {
+		t.Run(string(tc.adapter), func(t *testing.T) {
+			disks := []infrav1.NutanixMachineVMDisk{{
+				DiskSize: resource.MustParse("1Gi"),
+				DeviceProperties: &infrav1.NutanixMachineVMDiskDeviceProperties{
+					DeviceType:  infrav1.NutanixMachineDiskDeviceTypeCDRom,
+					AdapterType: tc.adapter,
+				},
+			}}
+			err := (&NutanixMachineReconciler{}).validateDataDisks(disks)
+			if tc.wantError {
+				require.ErrorContains(t, err, "invalid adapter type PCI")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestNutanixMachineValidateDataDisks(t *testing.T) {
@@ -1304,6 +1332,48 @@ func TestNutanixClusterReconcilerGetDiskList(t *testing.T) {
 			if tc.wantDisksLen != len(disks)+len(cdRoms) {
 				t.Fatalf("expected %d disks, got %d", tc.wantDisksLen, len(disks)+len(cdRoms))
 			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name       string
+		secureBoot bool
+		sataIndex  int32
+		wantIndex  int
+	}{
+		{name: "image bootstrap retains IDE without Secure Boot", sataIndex: -1},
+		{name: "image bootstrap uses SATA with Secure Boot", secureBoot: true, sataIndex: -1},
+		{name: "bootstrap avoids automatically assigned SATA disk index", secureBoot: true, sataIndex: 0, wantIndex: 1},
+		{name: "bootstrap preserves explicitly assigned SATA disk index", secureBoot: true, sataIndex: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			ntnxMachine, machine, cluster, convergedClient := tt[0].fixtures(mockCtrl)
+			ntnxMachine = ntnxMachine.DeepCopy()
+			ntnxMachine.Spec.BootType = infrav1.NutanixBootTypeUEFI
+			ntnxMachine.Spec.SecureBootEnabled = tc.secureBoot
+			if tc.sataIndex >= 0 {
+				ntnxMachine.Spec.DataDisks[0].DeviceProperties.AdapterType = infrav1.NutanixMachineDiskAdapterTypeSATA
+				ntnxMachine.Spec.DataDisks[0].DeviceProperties.DeviceIndex = tc.sataIndex
+			}
+			rctx := &nctx.MachineContext{
+				Context: context.Background(), NutanixMachine: ntnxMachine,
+				Machine: machine, NutanixCluster: cluster, ConvergedClient: convergedClient,
+			}
+			disks, cdRoms, err := getDiskList(rctx, *ntnxMachine.Spec.Cluster.UUID, nil, nil)
+			require.NoError(t, err)
+			require.Len(t, cdRoms, 1)
+			wantBus := vmmModels.CDROMBUSTYPE_IDE
+			if tc.secureBoot {
+				wantBus = vmmModels.CDROMBUSTYPE_SATA
+			}
+			assert.Equal(t, wantBus, *cdRoms[0].DiskAddress.BusType)
+			assert.Equal(t, tc.wantIndex, *cdRoms[0].DiskAddress.Index)
+			if tc.sataIndex >= 0 {
+				assert.Equal(t, int(tc.sataIndex), *disks[1].DiskAddress.Index)
+			}
+			vm := &vmmModels.Vm{Disks: disks, CdRoms: cdRoms}
+			require.NoError(t, (&NutanixMachineReconciler{}).addBootTypeToVM(rctx, vm))
 		})
 	}
 }
@@ -3114,7 +3184,7 @@ func TestNutanixMachineReconciler_getOrMintVMCreationRequestID(t *testing.T) {
 		mockK8sClient := mockctlclient.NewMockClient(ctrl)
 
 		var appliedPatch []byte
-		mockK8sClient.EXPECT().Patch(ctx, ntnxMachine, gomock.Any()).DoAndReturn(
+		mockK8sClient.EXPECT().Patch(ctx, gomock.AssignableToTypeOf(&infrav1.NutanixMachine{}), gomock.Any()).DoAndReturn(
 			func(_ context.Context, obj client.Object, patch client.Patch, _ ...client.PatchOption) error {
 				data, err := patch.Data(obj)
 				require.NoError(t, err)
@@ -3168,6 +3238,59 @@ func TestNutanixMachineReconciler_getOrMintVMCreationRequestID(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, existingRequestID, requestID)
 	})
+
+	t.Run("keeps unpersisted in-memory changes across the request-id patch", func(t *testing.T) {
+		ctx := context.Background()
+		// The API object has neither the finalizer nor bootstrapRef yet. reconcileNormal
+		// and ensureBootstrapRef set them in memory before this patch runs.
+		stored := &infrav1.NutanixMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-machine",
+				Namespace: "default",
+			},
+		}
+		scheme := runtime.NewScheme()
+		require.NoError(t, infrav1.AddToScheme(scheme))
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stored).Build()
+
+		live := stored.DeepCopy()
+		live.Finalizers = []string{infrav1.NutanixMachineFinalizer}
+		live.Spec.BootstrapRef = &corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       infrav1.NutanixMachineBootstrapRefKindSecret,
+			Name:       "bootstrap-secret",
+			Namespace:  "default",
+		}
+
+		reconciler := &NutanixMachineReconciler{Client: fakeClient}
+		rctx := &nctx.MachineContext{Context: ctx, NutanixMachine: live}
+
+		requestID, err := reconciler.getOrMintVMCreationRequestID(rctx)
+		require.NoError(t, err)
+		require.NotNil(t, live.Spec.BootstrapRef, "in-memory bootstrapRef must survive the patch response")
+		assert.Equal(t, "bootstrap-secret", live.Spec.BootstrapRef.Name)
+		assert.Equal(t, []string{infrav1.NutanixMachineFinalizer}, live.Finalizers, "in-memory finalizer must survive the patch response")
+		assert.Equal(t, requestID, live.Annotations[VMCreationRequestIDAnnotation])
+
+		persisted := &infrav1.NutanixMachine{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "test-machine"}, persisted))
+		assert.Equal(t, requestID, persisted.Annotations[VMCreationRequestIDAnnotation])
+	})
+}
+
+func TestAddGuestCustomizationNilBootstrapRef(t *testing.T) {
+	reconciler := &NutanixMachineReconciler{}
+	rctx := &nctx.MachineContext{
+		Context:        context.Background(),
+		NutanixMachine: &infrav1.NutanixMachine{},
+		Machine:        &capiv1beta2.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}},
+	}
+
+	err := reconciler.addGuestCustomizationToVM(rctx, vmmModels.NewVm())
+	require.Error(t, err)
+
+	err = reconciler.addGuestCustomizationToDeployParams(rctx, vmmModels.NewDeployVmFromVmProfileParams())
+	require.Error(t, err)
 }
 
 func TestNutanixMachineReconciler_getOrCreateVM(t *testing.T) {
@@ -3447,11 +3570,13 @@ func TestNutanixMachineReconciler_getOrCreateVM(t *testing.T) {
 				Namespace: "default",
 			},
 			Spec: infrav1.NutanixMachineSpec{
-				VCPUSockets:    2,
-				VCPUsPerSocket: 1,
-				MemorySize:     resource.MustParse("4Gi"),
-				SystemDiskSize: resource.MustParse("40Gi"),
-				BootType:       infrav1.NutanixBootTypeLegacy,
+				VCPUSockets:       2,
+				VCPUsPerSocket:    1,
+				MemorySize:        resource.MustParse("4Gi"),
+				SystemDiskSize:    resource.MustParse("40Gi"),
+				BootType:          infrav1.NutanixBootTypeUEFI,
+				SecureBootEnabled: true,
+				VTPMEnabled:       true,
 				Project: &infrav1.NutanixResourceIdentifier{
 					Type: infrav1.NutanixIdentifierName,
 					Name: &projectName,
@@ -3566,7 +3691,31 @@ func TestNutanixMachineReconciler_getOrCreateVM(t *testing.T) {
 		// that passes the plain ctx (and silently drops the key) fails here.
 		mockCreateOp := mockconverged.NewMockOperation[vmmModels.Vm](ctrl)
 		mockCreateOp.EXPECT().Wait(gomock.Any()).Return([]*vmmModels.Vm{createdVM}, nil)
-		mockConvergedClient.MockVMs.EXPECT().CreateAsync(ctxWithRequestID(), gomock.Any()).Return(mockCreateOp, nil)
+		mockConvergedClient.MockVMs.EXPECT().CreateAsync(ctxWithRequestID(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, request *vmmModels.Vm) (converged.Operation[vmmModels.Vm], error) {
+				require.NotNil(t, request.MachineType)
+				assert.Equal(t, vmmModels.MACHINETYPE_Q35, *request.MachineType)
+
+				require.NotNil(t, request.BootConfig)
+				uefi, ok := request.BootConfig.GetValue().(vmmModels.UefiBoot)
+				require.True(t, ok)
+				require.NotNil(t, uefi.IsSecureBootEnabled)
+				assert.True(t, *uefi.IsSecureBootEnabled)
+
+				require.NotNil(t, request.VtpmConfig)
+				require.NotNil(t, request.VtpmConfig.IsVtpmEnabled)
+				assert.True(t, *request.VtpmConfig.IsVtpmEnabled)
+
+				payload, err := json.Marshal(request)
+				require.NoError(t, err)
+				assert.Contains(t, string(payload), `"machineType":"Q35"`)
+				assert.Contains(t, string(payload), `"isSecureBootEnabled":true`)
+				assert.Contains(t, string(payload), `"vtpmConfig"`)
+				assert.Contains(t, string(payload), `"isVtpmEnabled":true`)
+
+				return mockCreateOp, nil
+			},
+		)
 
 		// Create machine context (PC 7.5 uses V3 project API, so ListAllProject mock is used)
 		rctx := &nctx.MachineContext{
@@ -3636,6 +3785,185 @@ func TestNutanixMachineReconciler_getOrCreateVM(t *testing.T) {
 		assert.Equal(t, vmUUID, persisted.Status.VmUUID)
 		assert.Equal(t, fmt.Sprintf("nutanix://%s", vmUUID), persisted.Spec.ProviderID)
 		assert.NotEmpty(t, persisted.Annotations[VMCreationRequestIDAnnotation])
+	})
+
+	t.Run("should return retryable error without failing the machine when created VM has nil ExtId", func(t *testing.T) {
+		// Regression test for the resource-leak guard: if PC creates the VM but the
+		// response carries a nil ExtId, getOrCreateVM must NOT set a terminal failure
+		// status. reconcileNormal skips machines with a failure status, which would
+		// orphan (leak) the VM that already exists in PC. Instead it returns a
+		// retryable error so the next reconcile adopts the VM by name.
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		ctx := context.Background()
+		vmName := "test-vm"
+		peUUID := "00056024-f4f2-a6f6-0000-00000000e7f4"
+		subnetUUID := "b8c6d9f0-4c5e-4c5e-8c5e-4c5e4c5e4c5e"
+		imageUUID := "c5e4c5e4-c5e4-c5e4-c5e4-c5e4c5e4c5e4"
+		clusterName := "test-cluster"
+		projectUUID := "c5e4c5e4-c5e4-c5e4-c5e4-c5e4c5e4cabc"
+		projectName := "test-project"
+
+		ntnxMachine := &infrav1.NutanixMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-machine",
+				Namespace: "default",
+			},
+			Spec: infrav1.NutanixMachineSpec{
+				VCPUSockets:    2,
+				VCPUsPerSocket: 1,
+				MemorySize:     resource.MustParse("4Gi"),
+				SystemDiskSize: resource.MustParse("40Gi"),
+				BootType:       infrav1.NutanixBootTypeLegacy,
+				Project: &infrav1.NutanixResourceIdentifier{
+					Type: infrav1.NutanixIdentifierName,
+					Name: &projectName,
+				},
+				Image: &infrav1.NutanixResourceIdentifier{
+					Type: infrav1.NutanixIdentifierUUID,
+					UUID: &imageUUID,
+				},
+				Cluster: infrav1.NutanixResourceIdentifier{
+					Type: infrav1.NutanixIdentifierUUID,
+					UUID: &peUUID,
+				},
+				Subnets: []infrav1.NutanixResourceIdentifier{
+					{
+						Type: infrav1.NutanixIdentifierUUID,
+						UUID: &subnetUUID,
+					},
+				},
+				BootstrapRef: &corev1.ObjectReference{
+					Kind:      infrav1.NutanixMachineBootstrapRefKindSecret,
+					Name:      "bootstrap-secret",
+					Namespace: "default",
+				},
+			},
+		}
+
+		machine := &capiv1beta2.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: vmName,
+			},
+			Spec: capiv1beta2.MachineSpec{
+				Version: "v1.28.0",
+			},
+		}
+
+		cluster := &capiv1beta2.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: "default",
+			},
+		}
+
+		ntnxCluster := &infrav1.NutanixCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: "default",
+			},
+			Status: infrav1.NutanixClusterStatus{
+				Conditions: capiv1beta1.Conditions{
+					{Type: infrav1.ClusterCategoryCreatedCondition, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+
+		mockConvergedClient := NewMockConvergedClient(ctrl)
+		mockV3Client := mocknutanixv3.NewMockService(ctrl)
+		v3Client := &prismclientv3.Client{V3: mockV3Client}
+
+		// FindVMByName returns empty (VM not found) so creation proceeds.
+		mockConvergedClient.MockVMs.EXPECT().List(ctx, gomock.Any()).Return([]vmmModels.Vm{}, nil)
+
+		mockConvergedClient.MockResourceGroups.EXPECT().ListPrismElements(ctx, "rg-uuid").Return(
+			[]converged.PrismElementInfo{
+				{ExtId: peUUID, Name: "pe_cluster"},
+			}, nil)
+
+		mockConvergedClient.MockSubnets.EXPECT().Get(ctx, subnetUUID).Return(&subnetModels.Subnet{
+			ExtId: &subnetUUID,
+		}, nil)
+
+		categoryExtId := "category-ext-id"
+		createdCategory := &prismModels.Category{
+			ExtId: &categoryExtId,
+			Key:   ptr.To(infrav1.DefaultCAPICategoryKeyForName),
+			Value: ptr.To(clusterName),
+		}
+		gomock.InOrder(
+			mockConvergedClient.MockCategories.EXPECT().List(ctx, gomock.Any()).Return([]prismModels.Category{}, nil),
+			mockConvergedClient.MockCategories.EXPECT().Create(ctx, gomock.Any()).Return(createdCategory, nil),
+			mockConvergedClient.MockCategories.EXPECT().List(ctx, gomock.Any()).Return([]prismModels.Category{*createdCategory}, nil).AnyTimes(),
+		)
+
+		mockConvergedClient.MockImages.EXPECT().Get(ctx, imageUUID).Return(&imageModels.Image{
+			ExtId: &imageUUID,
+		}, nil)
+
+		mockConvergedClient.MockTasks.EXPECT().List(ctx, gomock.Any()).Return([]prismModels.Task{}, nil)
+
+		// The VM is created in PC but the response carries a nil ExtId.
+		createdVM := vmmModels.NewVm()
+		createdVM.Name = ptr.To(vmName)
+		createdVM.ExtId = nil
+		mockCreateOp := mockconverged.NewMockOperation[vmmModels.Vm](ctrl)
+		mockCreateOp.EXPECT().Wait(gomock.Any()).Return([]*vmmModels.Vm{createdVM}, nil)
+		mockConvergedClient.MockVMs.EXPECT().CreateAsync(ctxWithRequestID(), gomock.Any()).Return(mockCreateOp, nil)
+
+		rctx := &nctx.MachineContext{
+			Context:         ctx,
+			Cluster:         cluster,
+			Machine:         machine,
+			NutanixMachine:  ntnxMachine,
+			NutanixCluster:  ntnxCluster,
+			NutanixClient:   v3Client,
+			ConvergedClient: mockConvergedClient.Client,
+			PCVersion:       "pc.7.5.0.5",
+		}
+
+		bootstrapSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bootstrap-secret",
+				Namespace: "default",
+			},
+			Data: map[string][]byte{
+				"value": []byte("#!/bin/bash\necho 'bootstrap'"),
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = infrav1.AddToScheme(scheme)
+		_ = capiv1beta2.AddToScheme(scheme)
+		_ = corev1.AddToScheme(scheme)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(ntnxMachine, bootstrapSecret).
+			WithStatusSubresource(ntnxMachine).
+			Build()
+
+		reconciler := &NutanixMachineReconciler{
+			Client: fakeClient,
+		}
+
+		vm, err := reconciler.getOrCreateVM(rctx, &nctx.ProjectInfo{ExtID: &projectUUID, Name: &projectName}, &projectModels.ResourceGroup{ExtId: ptr.To("rg-uuid")})
+
+		// A nil ExtId must surface as a (retryable) error and no VM.
+		require.Error(t, err)
+		assert.Nil(t, vm)
+		assert.Contains(t, err.Error(), "nil VM or ExtId")
+
+		// Critically, the machine must NOT be marked as terminally failed, otherwise
+		// reconcileNormal would never retry and the created VM would leak in PC.
+		assert.Nil(t, ntnxMachine.Status.FailureReason, "machine must not be marked failed on nil ExtId")
+		assert.Nil(t, ntnxMachine.Status.FailureMessage, "machine must not be marked failed on nil ExtId")
+
+		persisted := &infrav1.NutanixMachine{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(ntnxMachine), persisted))
+		assert.Nil(t, persisted.Status.FailureReason)
+		assert.Nil(t, persisted.Status.FailureMessage)
 	})
 
 	t.Run("should set failure status when category lookup returns not found", func(t *testing.T) {
@@ -4216,6 +4544,147 @@ func TestNutanixMachineReconciler_buildDeployParamsFromProfile_CategoryErrorHand
 		assert.Nil(t, rctx.NutanixMachine.Status.FailureReason)
 		assert.Nil(t, rctx.NutanixMachine.Status.FailureMessage)
 	})
+}
+
+func TestNutanixMachineReconciler_addBootTypeToVM(t *testing.T) {
+	tests := []struct {
+		name           string
+		spec           infrav1.NutanixMachineSpec
+		wantError      string
+		wantUEFI       bool
+		wantSecureBoot bool
+		wantVTPM       bool
+		diskBus        *vmmModels.DiskBusType
+		cdRomBus       *vmmModels.CdRomBusType
+	}{
+		{
+			name: "leaves the Nutanix defaults unchanged when no boot security is configured",
+		},
+		{
+			name: "configures UEFI without Secure Boot",
+			spec: infrav1.NutanixMachineSpec{
+				BootType: infrav1.NutanixBootTypeUEFI,
+			},
+			wantUEFI: true,
+		},
+		{
+			name: "enables UEFI Secure Boot",
+			spec: infrav1.NutanixMachineSpec{
+				BootType:          infrav1.NutanixBootTypeUEFI,
+				SecureBootEnabled: true,
+			},
+			wantUEFI:       true,
+			wantSecureBoot: true,
+		},
+		{
+			name: "enables UEFI Secure Boot and vTPM",
+			spec: infrav1.NutanixMachineSpec{
+				BootType:          infrav1.NutanixBootTypeUEFI,
+				SecureBootEnabled: true,
+				VTPMEnabled:       true,
+			},
+			wantUEFI:       true,
+			wantSecureBoot: true,
+			wantVTPM:       true,
+		},
+		{
+			name: "rejects Secure Boot with legacy boot",
+			spec: infrav1.NutanixMachineSpec{
+				BootType:          infrav1.NutanixBootTypeLegacy,
+				SecureBootEnabled: true,
+			},
+			wantError: "secure boot requires boot type uefi",
+		},
+		{
+			name: "rejects vTPM without Secure Boot",
+			spec: infrav1.NutanixMachineSpec{
+				BootType:    infrav1.NutanixBootTypeUEFI,
+				VTPMEnabled: true,
+			},
+			wantError: "vTPM requires secure boot to be enabled",
+		},
+		{
+			name:      "rejects IDE disks with Secure Boot",
+			spec:      infrav1.NutanixMachineSpec{BootType: infrav1.NutanixBootTypeUEFI, SecureBootEnabled: true},
+			diskBus:   vmmModels.DISKBUSTYPE_IDE.Ref(),
+			wantError: "secure boot requires Q35, which does not support IDE disk 0; use a compatible disk adapter",
+		},
+		{
+			name:      "rejects user-configured IDE CD-ROMs with Secure Boot",
+			spec:      infrav1.NutanixMachineSpec{BootType: infrav1.NutanixBootTypeUEFI, SecureBootEnabled: true},
+			cdRomBus:  vmmModels.CDROMBUSTYPE_IDE.Ref(),
+			wantError: "secure boot requires Q35, which does not support IDE CD-ROM 0; use a SATA CD-ROM",
+		},
+		{
+			name:           "accepts SCSI disks and SATA CD-ROMs with Secure Boot",
+			spec:           infrav1.NutanixMachineSpec{BootType: infrav1.NutanixBootTypeUEFI, SecureBootEnabled: true},
+			diskBus:        vmmModels.DISKBUSTYPE_SCSI.Ref(),
+			cdRomBus:       vmmModels.CDROMBUSTYPE_SATA.Ref(),
+			wantUEFI:       true,
+			wantSecureBoot: true,
+		},
+		{
+			name:     "accepts IDE devices without Secure Boot",
+			spec:     infrav1.NutanixMachineSpec{BootType: infrav1.NutanixBootTypeUEFI},
+			diskBus:  vmmModels.DISKBUSTYPE_IDE.Ref(),
+			cdRomBus: vmmModels.CDROMBUSTYPE_IDE.Ref(),
+			wantUEFI: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reconciler := &NutanixMachineReconciler{}
+			machineContext := &nctx.MachineContext{
+				Context: context.Background(),
+				NutanixMachine: &infrav1.NutanixMachine{
+					Spec: tt.spec,
+				},
+			}
+			vm := vmmModels.NewVm()
+			if tt.diskBus != nil {
+				vm.Disks = []vmmModels.Disk{{DiskAddress: &vmmModels.DiskAddress{BusType: tt.diskBus}}}
+			}
+			if tt.cdRomBus != nil {
+				vm.CdRoms = []vmmModels.CdRom{{DiskAddress: &vmmModels.CdRomAddress{BusType: tt.cdRomBus}}}
+			}
+
+			err := reconciler.addBootTypeToVM(machineContext, vm)
+			if tt.wantError != "" {
+				require.EqualError(t, err, tt.wantError)
+				return
+			}
+			require.NoError(t, err)
+
+			if !tt.wantUEFI {
+				assert.Nil(t, vm.BootConfig)
+			} else {
+				require.NotNil(t, vm.BootConfig)
+				uefi, ok := vm.BootConfig.GetValue().(vmmModels.UefiBoot)
+				require.True(t, ok)
+				if tt.wantSecureBoot {
+					require.NotNil(t, uefi.IsSecureBootEnabled)
+					assert.True(t, *uefi.IsSecureBootEnabled)
+				} else {
+					assert.Nil(t, uefi.IsSecureBootEnabled)
+				}
+			}
+			if tt.wantSecureBoot {
+				require.NotNil(t, vm.MachineType)
+				assert.Equal(t, vmmModels.MACHINETYPE_Q35, *vm.MachineType)
+			} else {
+				assert.Nil(t, vm.MachineType)
+			}
+
+			if tt.wantVTPM {
+				require.NotNil(t, vm.VtpmConfig)
+				require.NotNil(t, vm.VtpmConfig.IsVtpmEnabled)
+				assert.True(t, *vm.VtpmConfig.IsVtpmEnabled)
+			} else {
+				assert.Nil(t, vm.VtpmConfig)
+			}
+		})
+	}
 }
 
 func TestNutanixMachineReconciler_assignAddressesToMachine(t *testing.T) {
@@ -5966,6 +6435,210 @@ func TestGetMetroSiteFailureDomainSpec_FallbacksToNativeWhenRecoveryPlanJobLooku
 	g.Expect(ptr.Deref(fdSpec.PrismElementCluster.UUID, "")).To(Equal(fd0PEUUID))
 	g.Expect(rctx.NutanixMachine.Labels[metroNativeFailureDomainLabelKey]).To(Equal(fd0Name))
 	g.Expect(ptr.Deref(rctx.Datastore[nctx.MetroPreferredFailureDomainName], "")).To(Equal(fd0Name))
+}
+
+func TestGetMetroSiteFailureDomainSpec_EmptyRecoveryPlanJobPlacesOnPairedSiteWhenNativePEUnavailable(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	g := NewWithT(t)
+
+	const (
+		ns          = "default"
+		metroName   = "metro-empty-rpj"
+		metroSite   = "metrosite-empty-rpj"
+		fd0Name     = "fd-0"
+		fd1Name     = "fd-1"
+		fd0PEUUID   = "00000000-0000-0000-0000-000000000040"
+		fd1PEUUID   = "00000000-0000-0000-0000-000000000041"
+		recoveryPID = "rp-native-fd0-empty"
+	)
+
+	_, fd1, fakeClient, nutanixCluster := metroSitePlacementObjects(t, ns, metroName, metroSite, fd0Name, fd1Name, fd0PEUUID, fd1PEUUID, recoveryPID, "cluster-empty-rpj")
+
+	mockConvergedClient := NewMockConvergedClient(ctrl)
+	mockConvergedClient.MockClusters.EXPECT().Get(gomock.Any(), fd0PEUUID).Return(
+		&clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{IsAvailable: ptr.To(false)}}, nil,
+	).AnyTimes()
+	mockConvergedClient.MockClusters.EXPECT().Get(gomock.Any(), fd1PEUUID).Return(
+		&clustermgmtconfig.Cluster{ExtId: ptr.To(fd1PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{IsAvailable: ptr.To(true)}}, nil,
+	).AnyTimes()
+
+	mockV3Client := mocknutanixv3.NewMockService(ctrl)
+	mockV3Client.EXPECT().ListRecoveryPlanJobs(gomock.Any(), gomock.Any()).Return(&prismclientv3.RecoveryPlanJobListResponse{}, nil)
+
+	rctx := &nctx.MachineContext{
+		Context:         context.Background(),
+		NutanixClient:   &prismclientv3.Client{V3: mockV3Client},
+		ConvergedClient: mockConvergedClient.Client,
+		Cluster:         &capiv1beta2.Cluster{ObjectMeta: metav1.ObjectMeta{Name: nutanixCluster.Name, Namespace: ns}},
+		Machine:         &capiv1beta2.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-empty-rpj", Namespace: ns}},
+		NutanixCluster:  nutanixCluster,
+		NutanixMachine:  &infrav1.NutanixMachine{ObjectMeta: metav1.ObjectMeta{Name: "nm-empty-rpj", Namespace: ns}},
+	}
+
+	reconciler := &NutanixMachineReconciler{Client: fakeClient}
+	fdSpec, err := reconciler.getMetroSiteFailureDomainSpec(rctx, metroSite)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(ptr.Deref(fdSpec.PrismElementCluster.UUID, "")).To(Equal(fd1PEUUID))
+	g.Expect(rctx.NutanixMachine.Labels[metroNativeFailureDomainLabelKey]).To(Equal(fd0Name))
+	g.Expect(ptr.Deref(rctx.Datastore[nctx.MetroPreferredFailureDomainName], "")).To(Equal(fd0Name))
+	g.Expect(rctx.NutanixMachine.Annotations[metroActivePlacementPEAnnotation]).To(Equal(fd1.Spec.PrismElementCluster.String()))
+}
+
+func TestResolveMetroPlacementFailureDomainFromRecoveryPlanJob_EmptyJob(t *testing.T) {
+	const (
+		ns          = "default"
+		metroName   = "metro-empty-rpj-resolver"
+		metroSite   = "metrosite-empty-rpj-resolver"
+		fd0Name     = "fd-0"
+		fd1Name     = "fd-1"
+		fd0PEUUID   = "00000000-0000-0000-0000-000000000050"
+		fd1PEUUID   = "00000000-0000-0000-0000-000000000051"
+		recoveryPID = "rp-native-fd0-resolver"
+	)
+
+	tests := []struct {
+		name         string
+		nativePE     *clustermgmtconfig.Cluster
+		nativeGetErr error
+		fdObjs       func(fd0, fd1 *infrav1.NutanixFailureDomain) []*infrav1.NutanixFailureDomain
+		wantName     string
+	}{
+		{
+			name:     "available native PE stays unset so the caller keeps the native site",
+			nativePE: &clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{IsAvailable: ptr.To(true)}},
+		},
+		{
+			name:     "missing isAvailable stays unset",
+			nativePE: &clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{}},
+		},
+		{
+			name:     "missing cluster config stays unset",
+			nativePE: &clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID)},
+		},
+		{
+			name:         "availability lookup error stays unset",
+			nativeGetErr: fmt.Errorf("temporary prism error"),
+		},
+		{
+			name:     "unavailable native PE returns the paired failure domain",
+			nativePE: &clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{IsAvailable: ptr.To(false)}},
+			wantName: fd1Name,
+		},
+		{
+			name:     "unavailable native PE with no paired failure domain stays unset",
+			nativePE: &clustermgmtconfig.Cluster{ExtId: ptr.To(fd0PEUUID), Config: &clustermgmtconfig.ClusterConfigReference{IsAvailable: ptr.To(false)}},
+			fdObjs: func(fd0, _ *infrav1.NutanixFailureDomain) []*infrav1.NutanixFailureDomain {
+				return []*infrav1.NutanixFailureDomain{fd0}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			g := NewWithT(t)
+
+			fd0, fd1, fakeClient, nutanixCluster := metroSitePlacementObjects(t, ns, metroName, metroSite, fd0Name, fd1Name, fd0PEUUID, fd1PEUUID, recoveryPID, "cluster-empty-rpj-resolver")
+
+			mockConvergedClient := NewMockConvergedClient(mockCtrl)
+			mockConvergedClient.MockClusters.EXPECT().Get(gomock.Any(), fd0PEUUID).Return(tt.nativePE, tt.nativeGetErr)
+
+			mockV3Client := mocknutanixv3.NewMockService(mockCtrl)
+			mockV3Client.EXPECT().ListRecoveryPlanJobs(gomock.Any(), gomock.Any()).Return(&prismclientv3.RecoveryPlanJobListResponse{}, nil)
+
+			rctx := &nctx.MachineContext{
+				Context:         context.Background(),
+				NutanixClient:   &prismclientv3.Client{V3: mockV3Client},
+				ConvergedClient: mockConvergedClient.Client,
+				NutanixCluster:  nutanixCluster,
+			}
+			fdObjs := []*infrav1.NutanixFailureDomain{fd0, fd1}
+			if tt.fdObjs != nil {
+				fdObjs = tt.fdObjs(fd0, fd1)
+			}
+
+			reconciler := &NutanixMachineReconciler{Client: fakeClient}
+			got, err := reconciler.resolveMetroPlacementFailureDomainFromRecoveryPlanJob(rctx, metroName, fd0, fdObjs)
+			g.Expect(err).ToNot(HaveOccurred())
+			if tt.wantName == "" {
+				g.Expect(got).To(BeNil())
+				return
+			}
+			g.Expect(got).ToNot(BeNil())
+			g.Expect(got.Name).To(Equal(tt.wantName))
+		})
+	}
+}
+
+func metroSitePlacementObjects(
+	t *testing.T,
+	ns, metroName, metroSite, fd0Name, fd1Name, fd0PEUUID, fd1PEUUID, recoveryPID, clusterName string,
+) (*infrav1.NutanixFailureDomain, *infrav1.NutanixFailureDomain, client.Client, *infrav1.NutanixCluster) {
+	t.Helper()
+	g := NewWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(infrav1.AddToScheme(scheme)).To(Succeed())
+	g.Expect(capiv1beta2.AddToScheme(scheme)).To(Succeed())
+
+	fd0 := &infrav1.NutanixFailureDomain{
+		ObjectMeta: metav1.ObjectMeta{Name: fd0Name, Namespace: ns},
+		Spec: infrav1.NutanixFailureDomainSpec{
+			PrismElementCluster: infrav1.NutanixResourceIdentifier{Type: infrav1.NutanixIdentifierUUID, UUID: ptr.To(fd0PEUUID)},
+		},
+	}
+	fd1 := &infrav1.NutanixFailureDomain{
+		ObjectMeta: metav1.ObjectMeta{Name: fd1Name, Namespace: ns},
+		Spec: infrav1.NutanixFailureDomainSpec{
+			PrismElementCluster: infrav1.NutanixResourceIdentifier{Type: infrav1.NutanixIdentifierUUID, UUID: ptr.To(fd1PEUUID)},
+		},
+	}
+	metro := &infrav1.NutanixMetro{
+		ObjectMeta: metav1.ObjectMeta{Name: metroName, Namespace: ns},
+		Spec: infrav1.NutanixMetroSpec{
+			FailureDomains: []corev1.LocalObjectReference{{Name: fd0Name}, {Name: fd1Name}},
+		},
+	}
+	metrositeObj := &infrav1.NutanixMetroSite{
+		ObjectMeta: metav1.ObjectMeta{Name: metroSite, Namespace: ns},
+		Spec: infrav1.NutanixMetroSiteSpec{
+			MetroRef:               corev1.LocalObjectReference{Name: metroName},
+			PreferredFailureDomain: corev1.LocalObjectReference{Name: fd0Name},
+		},
+	}
+	nutanixCluster := &infrav1.NutanixCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns, UID: apitypes.UID(clusterName)},
+	}
+	vha := &infrav1.NutanixVirtualHADomain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName + "-vha",
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: infrav1.GroupVersion.String(),
+				Kind:       infrav1.NutanixClusterKind,
+				Name:       nutanixCluster.Name,
+				UID:        nutanixCluster.UID,
+			}},
+		},
+		Spec: infrav1.NutanixVirtualHADomainSpec{
+			MetroRef: corev1.LocalObjectReference{Name: metroName},
+			MovementGroups: []infrav1.NutanixMovementGroup{{
+				Name: clusterScopeMovementGroupName,
+				CategoryRecoveryPlans: []infrav1.NutanixCategoryRecoveryPlan{
+					{
+						FailureDomainRef: corev1.LocalObjectReference{Name: fd0Name},
+						RecoveryPlan:     infrav1.NutanixResourceIdentifier{Type: infrav1.NutanixIdentifierUUID, UUID: ptr.To(recoveryPID)},
+					},
+				},
+			}},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(fd0, fd1, metro, metrositeObj, nutanixCluster, vha).Build()
+	return fd0, fd1, fakeClient, nutanixCluster
 }
 
 func newRecoveryPlanJobIntentResponse(recoveryPlanUUID, activePEUUID string) *prismclientv3.RecoveryPlanJobIntentResponse {

@@ -688,6 +688,11 @@ func (r *NutanixMachineReconciler) reconcileNormal(rctx *nctx.MachineContext) (r
 		log.Error(err, fmt.Sprintf("Failed to create VM %s.", rctx.Machine.Name))
 		return reconcile.Result{}, err
 	}
+	if vm.ExtId == nil {
+		err := fmt.Errorf("VM %s returned from getOrCreateVM has a nil ExtId", rctx.Machine.Name)
+		log.Error(err, "unexpected nil VM UUID")
+		return reconcile.Result{}, err
+	}
 	log.V(1).Info(fmt.Sprintf("Found VM with name: %s, vmUUID: %s", rctx.Machine.Name, *vm.ExtId))
 
 	// API errors are retried on the next loop without blocking VM provisioning progress.
@@ -1234,7 +1239,10 @@ func (r *NutanixMachineReconciler) resolveMetroPlacementFailureDomainFromRecover
 		return nil, err
 	}
 	if latestJob == nil {
-		return nil, nil
+		// No job has run for this recovery plan. An explicitly unreachable native Prism Element
+		// still cannot take the VM, so place it on the paired site. A lookup error or a missing
+		// isAvailable field keeps the native site: callers place there when this returns nil.
+		return pairedFailureDomainIfNativePEUnavailable(rctx, nativeFd, fdObjs), nil
 	}
 
 	activePEUUID := activePlacementPEUUIDFromRecoveryPlanJob(latestJob)
@@ -1257,6 +1265,53 @@ func (r *NutanixMachineReconciler) resolveMetroPlacementFailureDomainFromRecover
 	}
 
 	return nil, nil
+}
+
+// pairedFailureDomainIfNativePEUnavailable returns the other metro failure domain when the native
+// Prism Element reports config.isAvailable == false. It returns nil when the site is available,
+// availability is unset, the lookup fails, or there is no paired failure domain. Callers treat nil
+// as "place on the native failure domain".
+func pairedFailureDomainIfNativePEUnavailable(
+	rctx *nctx.MachineContext,
+	nativeFd *infrav1.NutanixFailureDomain,
+	fdObjs []*infrav1.NutanixFailureDomain,
+) *infrav1.NutanixFailureDomain {
+	if rctx == nil || nativeFd == nil || rctx.ConvergedClient == nil {
+		return nil
+	}
+
+	log := ctrl.LoggerFrom(rctx.Context)
+	pe := nativeFd.Spec.PrismElementCluster
+	peCluster, err := GetPEClusterByIdentifier(rctx.Context, rctx.ConvergedClient, pe.Name, pe.UUID)
+	if err != nil {
+		log.Error(err, "Failed to read native Prism Element availability with no Recovery Plan Job; keeping native placement", "failureDomain", nativeFd.Name)
+		return nil
+	}
+	if peCluster == nil || peCluster.Config == nil || peCluster.Config.IsAvailable == nil || *peCluster.Config.IsAvailable {
+		var isAvailable *bool
+		if peCluster != nil && peCluster.Config != nil {
+			isAvailable = peCluster.Config.IsAvailable
+		}
+		log.Info("Recovery Plan Job list is empty; keeping native placement",
+			"failureDomain", nativeFd.Name,
+			"prismElement", pe.String(),
+			"isAvailable", isAvailable,
+		)
+		return nil
+	}
+
+	for _, fdObj := range fdObjs {
+		if fdObj == nil || fdObj.Name == nativeFd.Name {
+			continue
+		}
+		log.Info("Recovery Plan Job list is empty and native Prism Element is unavailable; placing on paired failure domain",
+			"nativeFailureDomain", nativeFd.Name,
+			"placementFailureDomain", fdObj.Name,
+		)
+		return fdObj
+	}
+
+	return nil
 }
 
 func findMetroRecoveryPlanUUIDByFailureDomain(
@@ -1772,7 +1827,7 @@ func validateDataDiskDeviceProperties(disk infrav1.NutanixMachineVMDisk, errors 
 		validAdapterTypes[infrav1.NutanixMachineDiskAdapterTypeIDE] = true
 	case infrav1.NutanixMachineDiskDeviceTypeCDRom:
 		validAdapterTypes[infrav1.NutanixMachineDiskAdapterTypeIDE] = true
-		validAdapterTypes[infrav1.NutanixMachineDiskAdapterTypePCI] = true
+		validAdapterTypes[infrav1.NutanixMachineDiskAdapterTypeSATA] = true
 	default:
 		errors = append(errors, fmt.Errorf("invalid device type %s for data disk", disk.DeviceProperties.DeviceType))
 	}
@@ -1835,22 +1890,25 @@ func (r *NutanixMachineReconciler) getOrMintVMCreationRequestID(rctx *nctx.Machi
 		return requestID, nil
 	}
 
-	// Snapshot the object *before* mutating it: patchMachine builds its diff baseline from
-	// rctx.NutanixMachine at the time it's called, so if we mutated it first, the baseline
-	// would already contain the new annotation and the resulting patch would be a no-op -
-	// silently defeating the "persist before anything else" guarantee this function exists
-	// to provide.
-	before := rctx.NutanixMachine.DeepCopy()
-
+	// Patch a copy, not rctx.NutanixMachine. The client overwrites the object it is given
+	// with the API server's response, which would discard every change made in memory
+	// earlier in this reconcile that is not persisted yet (the finalizer, spec.bootstrapRef).
+	// Those stay on rctx.NutanixMachine and are persisted by the deferred patch in Reconcile.
 	requestID := uuid.NewString()
+	patched := rctx.NutanixMachine.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[VMCreationRequestIDAnnotation] = requestID
+
+	if err := r.Patch(rctx.Context, patched, client.MergeFrom(rctx.NutanixMachine)); err != nil {
+		return "", fmt.Errorf("failed to persist vm creation request id: %w", err)
+	}
+
 	if rctx.NutanixMachine.Annotations == nil {
 		rctx.NutanixMachine.Annotations = map[string]string{}
 	}
 	rctx.NutanixMachine.Annotations[VMCreationRequestIDAnnotation] = requestID
-
-	if err := r.Patch(rctx.Context, rctx.NutanixMachine, client.MergeFrom(before)); err != nil {
-		return "", fmt.Errorf("failed to persist vm creation request id: %w", err)
-	}
 
 	return requestID, nil
 }
@@ -1879,7 +1937,7 @@ func (r *NutanixMachineReconciler) getOrCreateVM(rctx *nctx.MachineContext, effe
 
 	// if VM exists
 	if vmFound != nil {
-		log.Info(fmt.Sprintf("vm %s found with UUID %s", *vmFound.Name, rctx.NutanixMachine.Status.VmUUID))
+		log.Info(fmt.Sprintf("vm %s found with UUID %s", ptr.Deref(vmFound.Name, vmName), rctx.NutanixMachine.Status.VmUUID))
 		markVMProvisioned(rctx)
 		return vmFound, nil
 	}
@@ -2039,6 +2097,9 @@ func (r *NutanixMachineReconciler) getOrCreateVM(rctx *nctx.MachineContext, effe
 		return nil, err
 	}
 
+	if vm == nil || vm.ExtId == nil {
+		return nil, fmt.Errorf("created VM %s returned a nil VM or ExtId; will retry to adopt it", vmName)
+	}
 	vmUuid := *vm.ExtId
 	powerState := "UNKNOWN"
 	if vm.PowerState != nil {
@@ -2145,6 +2206,9 @@ func (r *NutanixMachineReconciler) deployVMFromProfile(rctx *nctx.MachineContext
 	}
 	vm := vmCreatedList[0]
 
+	if vm == nil || vm.ExtId == nil {
+		return nil, fmt.Errorf("VM %s deployed from profile %s returned a nil VM or ExtId; will retry to adopt it", vmName, vmProfileUUID)
+	}
 	vmUuid := *vm.ExtId
 	powerState := "UNKNOWN"
 	if vm.PowerState != nil {
@@ -2172,7 +2236,15 @@ func (r *NutanixMachineReconciler) addCustomAttributes(rctx *nctx.MachineContext
 	log := ctrl.LoggerFrom(ctx)
 	convergedClient := rctx.ConvergedClient
 
-	vmName := *vm.Name
+	machineName := ""
+	if rctx.Machine != nil {
+		machineName = rctx.Machine.Name
+	}
+	vmName := ptr.Deref(vm.Name, machineName)
+
+	if vm.ExtId == nil {
+		return fmt.Errorf("cannot add custom attributes: VM %s has a nil ExtId", vmName)
+	}
 
 	if slices.ContainsFunc(vm.CustomAttributes, func(attr string) bool {
 		return strings.HasPrefix(attr, vmCustomAttributePrefix4ProviderID)
@@ -2396,6 +2468,9 @@ func (r *NutanixMachineReconciler) logProfileNicMapping(
 func (r *NutanixMachineReconciler) addGuestCustomizationToDeployParams(rctx *nctx.MachineContext, params *vmmconfig.DeployVmFromVmProfileParams) error {
 	// Get the bootstrapData
 	bootstrapRef := rctx.NutanixMachine.Spec.BootstrapRef
+	if bootstrapRef == nil {
+		return errors.New("NutanixMachine spec.BootstrapRef is nil.")
+	}
 	if bootstrapRef.Kind == infrav1.NutanixMachineBootstrapRefKindSecret {
 		bootstrapData, err := r.getBootstrapData(rctx)
 		if err != nil {
@@ -2486,6 +2561,9 @@ func (r *NutanixMachineReconciler) powerOnVM(rctx *nctx.MachineContext, vmUUID, 
 func (r *NutanixMachineReconciler) addGuestCustomizationToVM(rctx *nctx.MachineContext, vm *vmmconfig.Vm) error {
 	// Get the bootstrapData
 	bootstrapRef := rctx.NutanixMachine.Spec.BootstrapRef
+	if bootstrapRef == nil {
+		return errors.New("NutanixMachine spec.BootstrapRef is nil.")
+	}
 	if bootstrapRef.Kind == infrav1.NutanixMachineBootstrapRefKindSecret {
 		bootstrapData, err := r.getBootstrapData(rctx)
 		if err != nil {
@@ -2613,6 +2691,26 @@ func getDiskList(rctx *nctx.MachineContext, peUUID string, effectiveProject *nct
 	if err != nil {
 		return nil, nil, err
 	}
+	if rctx.NutanixMachine.Spec.SecureBootEnabled && len(cdRoms) > 0 {
+		// Keep user-specified addresses unchanged and give the bootstrap CD-ROM
+		// the first available SATA index.
+		usedIndexes := make(map[int]bool)
+		for _, disk := range dataDisks {
+			if address := disk.DiskAddress; address != nil && address.BusType != nil && *address.BusType == vmmconfig.DISKBUSTYPE_SATA && address.Index != nil {
+				usedIndexes[*address.Index] = true
+			}
+		}
+		for _, cdRom := range dataCdRoms {
+			if address := cdRom.DiskAddress; address != nil && address.BusType != nil && *address.BusType == vmmconfig.CDROMBUSTYPE_SATA && address.Index != nil {
+				usedIndexes[*address.Index] = true
+			}
+		}
+		index := 0
+		for usedIndexes[index] {
+			index++
+		}
+		cdRoms[0].DiskAddress.Index = ptr.To(index)
+	}
 	disks = append(disks, dataDisks...)
 	cdRoms = append(cdRoms, dataCdRoms...)
 
@@ -2702,6 +2800,9 @@ func getBootstrapDisk(rctx *nctx.MachineContext, effectiveProject *nctx.ProjectI
 	cdRom.DiskAddress = vmmconfig.NewCdRomAddress()
 	cdRom.DiskAddress.Index = ptr.To(0)
 	cdRom.DiskAddress.BusType = vmmconfig.CDROMBUSTYPE_IDE.Ref()
+	if rctx.NutanixMachine.Spec.SecureBootEnabled {
+		cdRom.DiskAddress.BusType = vmmconfig.CDROMBUSTYPE_SATA.Ref()
+	}
 	cdRom.BackingInfo = newVmDiskWithImageRef(bootstrapImage.ExtId, 0)
 
 	return cdRom, nil
@@ -2828,8 +2929,18 @@ func (r *NutanixMachineReconciler) assignAddressesToMachine(rctx *nctx.MachineCo
 		addresses = append(addresses, getAddressesFromNic(nic)...)
 	}
 
+	machineName := ""
+	if rctx.Machine != nil {
+		machineName = rctx.Machine.Name
+	}
+	vmName := ptr.Deref(vm.Name, machineName)
+
 	if len(addresses) == 0 {
-		return fmt.Errorf("unable to determine network interfaces from VM: %s. Retrying", *vm.Name)
+		return fmt.Errorf("unable to determine network interfaces from VM: %s. Retrying", vmName)
+	}
+
+	if vm.Name == nil {
+		return fmt.Errorf("unable to determine hostname from VM %s: nil Name. Retrying", machineName)
 	}
 
 	addresses = append(addresses, capiv1beta1.MachineAddress{
@@ -2873,8 +2984,45 @@ func (r *NutanixMachineReconciler) getMachineCategoryIdentifiers(rctx *nctx.Mach
 	return categoryIdentifiers, nil
 }
 
+func validateSecureBootDisks(vm *vmmconfig.Vm) error {
+	for i, disk := range vm.Disks {
+		if disk.DiskAddress != nil && disk.DiskAddress.BusType != nil && *disk.DiskAddress.BusType == vmmconfig.DISKBUSTYPE_IDE {
+			return fmt.Errorf("secure boot requires Q35, which does not support IDE disk %d; use a compatible disk adapter", i)
+		}
+	}
+	for i, cdRom := range vm.CdRoms {
+		if cdRom.DiskAddress != nil && cdRom.DiskAddress.BusType != nil && *cdRom.DiskAddress.BusType == vmmconfig.CDROMBUSTYPE_IDE {
+			return fmt.Errorf("secure boot requires Q35, which does not support IDE CD-ROM %d; use a SATA CD-ROM", i)
+		}
+	}
+	return nil
+}
+
 func (r *NutanixMachineReconciler) addBootTypeToVM(rctx *nctx.MachineContext, vm *vmmconfig.Vm) error {
 	bootType := rctx.NutanixMachine.Spec.BootType
+	secureBootEnabled := rctx.NutanixMachine.Spec.SecureBootEnabled
+	vtpmEnabled := rctx.NutanixMachine.Spec.VTPMEnabled
+
+	var bootError error
+	switch {
+	case secureBootEnabled && bootType != infrav1.NutanixBootTypeUEFI:
+		bootError = fmt.Errorf("secure boot requires boot type %s", string(infrav1.NutanixBootTypeUEFI))
+	case vtpmEnabled && !secureBootEnabled:
+		bootError = fmt.Errorf("vTPM requires secure boot to be enabled")
+	case secureBootEnabled:
+		bootError = validateSecureBootDisks(vm)
+	}
+	if bootError != nil {
+		v1beta1conditions.MarkFalse(rctx.NutanixMachine, infrav1.VMProvisionedCondition, infrav1.VMBootTypeInvalid, capiv1beta1.ConditionSeverityError, "%s", bootError.Error())
+		v1beta2conditions.Set(rctx.NutanixMachine, metav1.Condition{
+			Type:    string(infrav1.VMProvisionedCondition),
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.VMBootTypeInvalid,
+			Message: bootError.Error(),
+		})
+		return bootError
+	}
+
 	// Defaults to legacy if boot type is not set.
 	if bootType != "" {
 		if bootType != infrav1.NutanixBootTypeLegacy && bootType != infrav1.NutanixBootTypeUEFI {
@@ -2896,6 +3044,11 @@ func (r *NutanixMachineReconciler) addBootTypeToVM(rctx *nctx.MachineContext, vm
 		if bootType == infrav1.NutanixBootTypeUEFI {
 			uefi := vmmconfig.NewUefiBoot()
 			uefi.BootOrder = bootOrder
+			if secureBootEnabled {
+				uefi.IsSecureBootEnabled = ptr.To(true)
+				// Nutanix requires the Q35 machine type for Secure Boot.
+				vm.MachineType = ptr.To(vmmconfig.MACHINETYPE_Q35)
+			}
 			err := vm.BootConfig.SetValue(*uefi)
 			if err != nil {
 				return err
@@ -2908,6 +3061,11 @@ func (r *NutanixMachineReconciler) addBootTypeToVM(rctx *nctx.MachineContext, vm
 				return err
 			}
 		}
+	}
+
+	if vtpmEnabled {
+		vm.VtpmConfig = vmmconfig.NewVtpmConfig()
+		vm.VtpmConfig.IsVtpmEnabled = ptr.To(true)
 	}
 
 	return nil
